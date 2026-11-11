@@ -22,6 +22,11 @@ Edge 浏览器桥（bridge.py）
 
 版本 2.1：新增按需自拉 Edge（/launch 端点 + CDP 类请求的自动拉起），
 配合 install-autostart.bat 可实现开机自启、免手动开任何文件。
+
+版本 2.2：为自启场景补可观测性——日志同时写 bridge.log 文件、
+pythonw 无控制台时防 print 崩溃、启动全过程留痕、主流程异常
+捕获写日志；找 Tailscale 地址新增 tailscale.exe 全路径与
+ipconfig 解析两条方法。
 """
 
 import hmac
@@ -34,6 +39,8 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+from datetime import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,13 +59,33 @@ CDP_BASE = "http://127.0.0.1:9222"          # Edge 调试口，只绑本机
 DEFAULT_PORT = 8765                          # 桥的对外端口
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.path.join(BASE_DIR, "token.txt")
+LOG_FILE = os.path.join(BASE_DIR, "bridge.log")
 TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+
+# pythonw.exe 后台运行时 stdout/stderr 可能是 None 或无效句柄，
+# 直接 print 会抛错把进程带走。先把它们兜住。
+try:
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------- 工具
 
 def log(msg):
-    print(msg, flush=True)
+    line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def http_json(url, method="GET", timeout=5):
@@ -638,7 +665,7 @@ ENDPOINTS = {
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EdgeBridge/2.1"
+    server_version = "EdgeBridge/2.2"
 
     def log_message(self, fmt, *args):  # 只打简洁日志
         log("[%s] %s" % (self.address_string(), fmt % args))
@@ -666,7 +693,7 @@ class Handler(BaseHTTPRequestHandler):
                 cdp_info = "CDP 不可达: %s" % e
             self._send_json(200, {"ok": True, "cdp": cdp_ok,
                                   "browser": cdp_info,
-                                  "version": "2.1",
+                                  "version": "2.2",
                                   "mode": os.environ.get(
                                       "BRIDGE_MODE", "manual")})
         else:
@@ -732,11 +759,25 @@ def _in_tailscale_range(ip):
 def find_tailscale_ip():
     """想办法找出本机在 Tailscale 网络里的 IP（100.64.0.0/10），找不到返回 None。"""
     # 方法 1：tailscale 命令行（Windows / Linux 都适用）
+    # 自启进程的 PATH 可能没有 tailscale，再试一次全路径。
+    for cmd in (["tailscale", "ip", "-4"],
+                [r"C:\Program Files\Tailscale\tailscale.exe", "ip", "-4"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True,
+                                 text=True, timeout=5)
+            for line in (out.stdout or "").splitlines():
+                ip = line.strip()
+                if _in_tailscale_range(ip):
+                    return ip
+        except Exception:
+            pass
+    # 方法 1b：解析 ipconfig 输出，找 100.64/10 网段的地址。
+    # TUN 类代理劫持的是路由、动不了网卡本身的地址，这条最抗干扰。
     try:
-        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                             text=True, timeout=5)
-        for line in (out.stdout or "").splitlines():
-            ip = line.strip()
+        out = subprocess.run(["ipconfig"], capture_output=True,
+                             text=True, timeout=8)
+        import re
+        for ip in re.findall(r"\d{1,3}(?:\.\d{1,3}){3}", out.stdout or ""):
             if _in_tailscale_range(ip):
                 return ip
     except Exception:
@@ -763,12 +804,15 @@ def find_tailscale_ip():
 
 
 def main():
+    log("main 开始，模式=%s，解释器=%s" % (
+        os.environ.get("BRIDGE_MODE", "manual"), sys.executable))
     token = load_or_create_token()
     port = int(os.environ.get("BRIDGE_PORT", DEFAULT_PORT))
 
     forced = os.environ.get("BRIDGE_HOST")
     ts_ip = None if forced else find_tailscale_ip()
     host = forced or ts_ip or "127.0.0.1"
+    log("监听地址选定: %s（forced=%s, tailscale=%s）" % (host, forced, ts_ip))
 
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
@@ -791,4 +835,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # 自启时没有控制台，异常必须落进 bridge.log，否则无声无息
+        try:
+            log("致命异常，桥退出：\n" + traceback.format_exc())
+        except Exception:
+            pass
+        raise

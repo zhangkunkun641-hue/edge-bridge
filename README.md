@@ -74,18 +74,18 @@ edge-bridge is a small, single-file Python tool that lets a remote AI assistant 
 不想每次手动开文件的话，装一次自启，以后开机登录就全自动：
 
 1. 双击 **`install-autostart.bat`**（只需这一次）。它会：
-   - 生成守护脚本 `bridge-autostart.vbs`（桥若退出，隔一分钟自动再拉起）；
-   - 注册一个名为 `EdgeBridge` 的计划任务：登录 Windows 时静默启动桥，**没有黑窗口**；
-   - 并立刻启动一次，不用等下次开机。
+   - 生成守护脚本 `bridge-autostart.vbs`（桥若退出，隔 15 秒自动再拉起；守护与桥的运行全程写 `bridge.log`）；
+   - 注册开机自启——依次尝试三种免管理员方式：名为 `EdgeBridge` 的计划任务 → 注册表 `HKCU` 自启项 → 启动文件夹，哪条能用用哪条（有些机器建计划任务要管理员权限，会被系统拒绝，所以留了后两条路）；
+   - 立刻启动一次，不用等下次开机；并**当场自检**：等桥应答 `/health` 才报 `[DONE + VERIFIED]`，验不到会把 `bridge.log` 尾巴打在窗口里供排查。
 2. 此后桥常驻后台。**小号 Edge 也不用你开**：助手发来请求而 Edge 没在跑时，桥会自己用小号配置把 Edge 拉起来（可用环境变量 `BRIDGE_NO_AUTOLAUNCH=1` 关掉这个行为）。
-3. 停用：双击 **`uninstall-autostart.bat`** 删除计划任务（已在跑的后台桥会在注销/重启后消失）；或在 Tailscale 后台把助手设备移除，桥还在跑也连不进来。
+3. 停用：双击 **`uninstall-autostart.bat`** 清除上述三种自启注册（已在跑的后台桥会在注销/重启后消失）；或在 Tailscale 后台把助手设备移除，桥还在跑也连不进来。
 
 注意：自启模式下桥绑定的仍是同一个 Tailscale 地址和 token，和手动模式没有区别；两种模式不要同时开（端口只有一个，先开的那个占着）。
 
 ## 如何停止
 
 - 手动模式：关掉运行 `bridge.py` 的那个黑色窗口（或在窗口里按 `Ctrl+C`）。
-- 自启模式：双击 `uninstall-autostart.bat` 删掉计划任务，再注销或重启一次。
+- 自启模式：双击 `uninstall-autostart.bat` 清除自启注册（计划任务／注册表项／启动文件夹三处全清），再注销或重启一次。
 - 关掉用启动脚本打开的那个 Edge 的所有窗口（日常模式下记得再正常打开一次 Edge，就回到普通模式了）。
 
 两个都关掉，助手就完全连不上了。
