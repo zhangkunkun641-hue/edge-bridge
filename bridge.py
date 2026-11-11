@@ -27,6 +27,11 @@ Edge 浏览器桥（bridge.py）
 pythonw 无控制台时防 print 崩溃、启动全过程留痕、主流程异常
 捕获写日志；找 Tailscale 地址新增 tailscale.exe 全路径与
 ipconfig 解析两条方法。
+
+版本 2.3：修「小号被手动开过就接管不了」——拉起前先查小号
+配置的残留进程：无可见窗口的后台残留自动清掉再拉起；有可见
+窗口（用户在用）绝不下手、停手报错。顺带关掉小号的后台模式
+让残留不再产生；新增 /logs 接口供助手远程看 bridge.log。
 """
 
 import hmac
@@ -330,6 +335,82 @@ def find_msedge():
     return None
 
 
+def _profile_edge_processes():
+    """列出命令行带小号配置路径的 msedge 进程：[(pid, has_window), ...]。
+    只在 Windows 可用；查不到或出错返回 []。主配置的进程命令行不带
+    MuseEdgeProfile，永远不会被列进来。"""
+    if os.name != "nt":
+        return []
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*MuseEdgeProfile*' } | "
+        "ForEach-Object { $h = (Get-Process -Id $_.ProcessId "
+        "-ErrorAction SilentlyContinue).MainWindowHandle; "
+        "\"$($_.ProcessId)|$([int]($h -ne 0))\" }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=15)
+        result = []
+        for line in (out.stdout or "").splitlines():
+            parts = line.strip().split("|")
+            if len(parts) == 2 and parts[0].isdigit():
+                result.append((int(parts[0]), parts[1] == "1"))
+        return result
+    except Exception as e:
+        log("查小号 Edge 进程失败（忽略）: %s" % e)
+        return []
+
+
+def _cleanup_profile_edge():
+    """拉起前处理小号残留进程，返回 none / cleaned / blocked-window / failed。
+
+    硬规矩（用户 2026-11-12 定）：只清没有可见窗口的后台残留；
+    只要小号有可见窗口（多半是用户正在用），绝不下手，返回
+    blocked-window 让调用方停手报告。"""
+    procs = _profile_edge_processes()
+    if not procs:
+        return "none"
+    if any(has_win for _, has_win in procs):
+        log("小号 Edge 有可见窗口，停手不接管（进程 %s）"
+            % [p for p, _ in procs])
+        return "blocked-window"
+    log("发现小号 Edge 后台残留进程 %s，清理中" % [p for p, _ in procs])
+    for pid, _ in procs:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        except Exception as e:
+            log("结束小号残留进程 %s 失败: %s" % (pid, e))
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        if not _profile_edge_processes():
+            log("小号 Edge 残留进程已清干净")
+            return "cleaned"
+        time.sleep(0.5)
+    return "failed"
+
+
+def _harden_profile_prefs():
+    """关掉小号的「关窗后在后台继续运行」（background_mode），
+    让残留不再产生。只在小号进程全清时调用；尽力而为，失败忽略。"""
+    prefs_path = os.path.join(_EDGE_PROFILE_DIR, "Default", "Preferences")
+    try:
+        if not os.path.isfile(prefs_path):
+            return
+        with open(prefs_path, encoding="utf-8") as f:
+            prefs = json.load(f)
+        bm = prefs.setdefault("background_mode", {})
+        if bm.get("enabled") is not False:
+            bm["enabled"] = False
+            with open(prefs_path, "w", encoding="utf-8") as f:
+                json.dump(prefs, f, ensure_ascii=False)
+            log("已关闭小号 Edge 的后台模式（background_mode.enabled=false）")
+    except Exception as e:
+        log("改小号 Preferences 失败（忽略）: %s" % e)
+
+
 def ensure_edge(timeout=25):
     """Edge 调试口没开时，自动用小号配置把 Edge 拉起来并等它就绪。
     返回 {cdp, launched}；拉不起来时抛 CDPError 并说明原因。"""
@@ -343,6 +424,16 @@ def ensure_edge(timeout=25):
     with _launch_lock:
         if cdp_up():  # 等锁期间别人已经拉起来了
             return {"cdp": True, "launched": False}
+        state = _cleanup_profile_edge()
+        if state == "blocked-window":
+            raise CDPError(
+                "小号 Edge 正开着窗口（多半是用户在用），已停手不接管；"
+                "请先关掉那个窗口再重试。")
+        if state == "failed":
+            raise CDPError(
+                "小号 Edge 残留进程清不掉，请在任务管理器里结束 "
+                "msedge.exe 后再重试。")
+        _harden_profile_prefs()
         os.makedirs(_EDGE_PROFILE_DIR, exist_ok=True)
         flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
         subprocess.Popen(
@@ -640,6 +731,21 @@ def ep_launch(params):
     return ensure_edge()
 
 
+def ep_logs(params):
+    """返回 bridge.log 最后 N 行，供助手远程自查（仍需 token）。"""
+    try:
+        n = int(params.get("lines", 50))
+    except (TypeError, ValueError):
+        n = 50
+    n = max(1, min(n, 500))
+    try:
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    return {"lines": lines[-n:]}
+
+
 ENDPOINTS = {
     "/launch": ep_launch,
     "/tabs": ep_tabs,
@@ -659,13 +765,14 @@ ENDPOINTS = {
     "/wait": ep_wait,
     "/download_dir": ep_download_dir,
     "/upload": ep_upload,
+    "/logs": ep_logs,
 }
 
 
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EdgeBridge/2.2"
+    server_version = "EdgeBridge/2.3"
 
     def log_message(self, fmt, *args):  # 只打简洁日志
         log("[%s] %s" % (self.address_string(), fmt % args))
@@ -693,7 +800,7 @@ class Handler(BaseHTTPRequestHandler):
                 cdp_info = "CDP 不可达: %s" % e
             self._send_json(200, {"ok": True, "cdp": cdp_ok,
                                   "browser": cdp_info,
-                                  "version": "2.2",
+                                  "version": "2.3",
                                   "mode": os.environ.get(
                                       "BRIDGE_MODE", "manual")})
         else:

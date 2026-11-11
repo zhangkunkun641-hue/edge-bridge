@@ -82,6 +82,15 @@ edge-bridge is a small, single-file Python tool that lets a remote AI assistant 
 
 注意：自启模式下桥绑定的仍是同一个 Tailscale 地址和 token，和手动模式没有区别；两种模式不要同时开（端口只有一个，先开的那个占着）。
 
+### 拉起小号 Edge 时的残留处理（2.3 起）
+
+小号配置若已有进程在跑（比如手动开过又关了窗口、后台还留着进程），新拉起会被旧进程接管、调试口开不出来。桥拉起前会先处理，并且守两条硬规矩：
+
+- 只清**没有可见窗口**的小号后台残留进程（按命令行含 `MuseEdgeProfile` 识别，主配置的进程永远不碰），清完再拉起；
+- 小号只要**有可见窗口**（多半是有人正在用），绝不下手，停手报错等人处理。
+
+同时桥会把小号的「关窗后在后台继续运行」关掉（`background_mode`），让残留从源头少产生。处理过程都写在 `bridge.log` 里，也可以通过 `/logs` 接口远程查看。
+
 ## 如何停止
 
 - 手动模式：关掉运行 `bridge.py` 的那个黑色窗口（或在窗口里按 `Ctrl+C`）。
@@ -111,6 +120,7 @@ edge-bridge is a small, single-file Python tool that lets a remote AI assistant 
 | `/upload` | `selector`, `filePath` | 把你电脑上的文件塞进页面的文件选择框 |
 | `/download_dir` | `path` | 把浏览器下载目录设为你电脑上的指定目录 |
 | `/close` | `tabId` | 关闭指定标签页 |
+| `/logs` | `lines?` | 返回 `bridge.log` 最后 N 行（默认 50），供助手远程自查 |
 | `/cdp` | `method`, `params?`, `tabId?` | **原始 CDP 透传**，见下面专门说明 |
 
 调用示例（PowerShell，把地址和 token 换成桥窗口里打印的那两行）：
