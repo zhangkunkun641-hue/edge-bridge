@@ -17,6 +17,11 @@ Edge 浏览器桥（bridge.py）
 可选环境变量（一般不用管）：
       BRIDGE_HOST  强制指定监听地址（调试时用）
       BRIDGE_PORT  强制指定监听端口（默认 8765）
+      BRIDGE_MODE  运行模式标记（自启脚本会设为 autostart，/health 里回显）
+      BRIDGE_NO_AUTOLAUNCH=1  关掉「Edge 没开时自动拉起小号 Edge」
+
+版本 2.1：新增按需自拉 Edge（/launch 端点 + CDP 类请求的自动拉起），
+配合 install-autostart.bat 可实现开机自启、免手动开任何文件。
 """
 
 import hmac
@@ -264,6 +269,78 @@ class CDPManager:
 
 
 CDP = CDPManager()
+
+
+# ---------------------------------------------------------------- 按需拉起 Edge
+
+_EDGE_PROFILE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or "", "MuseEdgeProfile")
+_launch_lock = threading.Lock()
+
+
+def cdp_up():
+    try:
+        CDP.version()
+        return True
+    except Exception:
+        return False
+
+
+def find_msedge():
+    """在常见安装位置找 msedge.exe（只在 Windows 上找），找不到返回 None。"""
+    if os.name != "nt":
+        return None
+    candidates = []
+    for root in (os.environ.get("ProgramFiles(x86)"),
+                 os.environ.get("ProgramFiles"),
+                 os.environ.get("LOCALAPPDATA")):
+        if root:
+            candidates.append(os.path.join(
+                root, "Microsoft", "Edge", "Application", "msedge.exe"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def ensure_edge(timeout=25):
+    """Edge 调试口没开时，自动用小号配置把 Edge 拉起来并等它就绪。
+    返回 {cdp, launched}；拉不起来时抛 CDPError 并说明原因。"""
+    if cdp_up():
+        return {"cdp": True, "launched": False}
+    if os.name != "nt":
+        raise CDPError("自动拉起 Edge 只支持 Windows")
+    edge = find_msedge()
+    if not edge:
+        raise CDPError("自动拉起失败: 没找到 msedge.exe")
+    with _launch_lock:
+        if cdp_up():  # 等锁期间别人已经拉起来了
+            return {"cdp": True, "launched": False}
+        os.makedirs(_EDGE_PROFILE_DIR, exist_ok=True)
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        subprocess.Popen(
+            [edge, "--remote-debugging-port=9222",
+             "--remote-debugging-address=127.0.0.1",
+             "--user-data-dir=" + _EDGE_PROFILE_DIR,
+             "about:blank"],
+            creationflags=flags, close_fds=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cdp_up():
+                return {"cdp": True, "launched": True}
+            time.sleep(0.5)
+    raise CDPError(
+        "自动拉起 Edge 后调试口仍不可达。常见原因：小号 Edge 已经开着但"
+        "没带调试口（手动打开的那种）——请把 Edge 窗口全部关掉再重试。")
+
+
+def maybe_autolaunch():
+    """CDP 类请求进来时顺手保证 Edge 在跑；关掉开关或 Edge 已在跑时直接返回。"""
+    if os.environ.get("BRIDGE_NO_AUTOLAUNCH"):
+        return
+    if cdp_up():
+        return
+    ensure_edge()
 
 
 # ---------------------------------------------------------------- 业务端点
@@ -531,7 +608,13 @@ def ep_upload(params):
     return {"tabId": tab_id, "uploaded": file_path}
 
 
+def ep_launch(params):
+    """保证带调试口的小号 Edge 正在运行（没开就自动拉起）。"""
+    return ensure_edge()
+
+
 ENDPOINTS = {
+    "/launch": ep_launch,
     "/tabs": ep_tabs,
     "/open": ep_open,
     "/text": ep_text,
@@ -555,7 +638,7 @@ ENDPOINTS = {
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EdgeBridge/2.0"
+    server_version = "EdgeBridge/2.1"
 
     def log_message(self, fmt, *args):  # 只打简洁日志
         log("[%s] %s" % (self.address_string(), fmt % args))
@@ -582,7 +665,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # CDP 没启动也要正常回答
                 cdp_info = "CDP 不可达: %s" % e
             self._send_json(200, {"ok": True, "cdp": cdp_ok,
-                                  "browser": cdp_info})
+                                  "browser": cdp_info,
+                                  "version": "2.1",
+                                  "mode": os.environ.get(
+                                      "BRIDGE_MODE", "manual")})
         else:
             self._send_json(404, {"ok": False, "error": "未知路径: %s"
                                   % self.path})
@@ -606,6 +692,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "请求体不是合法 JSON: %s" % e})
             return
         try:
+            if path != "/launch":
+                maybe_autolaunch()
             result = ENDPOINTS[path](params)
             self._send_json(200, dict({"ok": True}, **result))
         except ValueError as e:      # 参数问题
