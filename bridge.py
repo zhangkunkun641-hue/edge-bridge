@@ -32,6 +32,12 @@ ipconfig 解析两条方法。
 配置的残留进程：无可见窗口的后台残留自动清掉再拉起；有可见
 窗口（用户在用）绝不下手、停手报错。顺带关掉小号的后台模式
 让残留不再产生；新增 /logs 接口供助手远程看 bridge.log。
+
+版本 2.4：修「冷开机抢跑绑错地址」——开机时桥若早于 Tailscale
+连通启动，旧版找不到专线地址就只绑 127.0.0.1 且永不重绑，自启
+形同失效（2026-11-12 晚实证）。新版启动时先等专线地址最多约
+2 分钟；仍等不到才先绑本机，且绑本机期间每 30 秒自检一次，
+专线地址一出现就自动重绑，无需人工重启进程。
 """
 
 import hmac
@@ -772,7 +778,7 @@ ENDPOINTS = {
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EdgeBridge/2.3"
+    server_version = "EdgeBridge/2.4"
 
     def log_message(self, fmt, *args):  # 只打简洁日志
         log("[%s] %s" % (self.address_string(), fmt % args))
@@ -800,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
                 cdp_info = "CDP 不可达: %s" % e
             self._send_json(200, {"ok": True, "cdp": cdp_ok,
                                   "browser": cdp_info,
-                                  "version": "2.3",
+                                  "version": "2.4",
                                   "mode": os.environ.get(
                                       "BRIDGE_MODE", "manual")})
         else:
@@ -915,30 +921,71 @@ def main():
         os.environ.get("BRIDGE_MODE", "manual"), sys.executable))
     token = load_or_create_token()
     port = int(os.environ.get("BRIDGE_PORT", DEFAULT_PORT))
-
     forced = os.environ.get("BRIDGE_HOST")
-    ts_ip = None if forced else find_tailscale_ip()
-    host = forced or ts_ip or "127.0.0.1"
-    log("监听地址选定: %s（forced=%s, tailscale=%s）" % (host, forced, ts_ip))
 
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
-    server.bridge_token = token
+    # 冷开机时桥可能早于 Tailscale 连通：先给专线地址留出等待窗口，
+    # 别一找不到就立刻绑本机（2.4 起）。
+    ts_ip = None
+    if not forced:
+        deadline = time.time() + 120
+        while True:
+            ts_ip = find_tailscale_ip()
+            if ts_ip or time.time() >= deadline:
+                break
+            log("暂未找到 Tailscale 地址，10 秒后重试（等专线连通）")
+            time.sleep(10)
 
-    log("=" * 62)
-    log("  Edge 浏览器桥已启动")
-    log("  连接地址: http://%s:%d" % (host, port))
-    log("  Token:    %s" % token)
-    log("  把上面「连接地址」和「Token」两行发给助手即可。")
-    if not forced and not ts_ip:
-        log("  !! 警告：没找到 Tailscale 网卡，现在只有本机能连。")
-        log("  !! 请确认 Tailscale 已安装并登录，再重新运行本桥。")
-    log("  停止方法：关掉这个窗口（或按 Ctrl+C），再关掉那个独立 Edge。")
-    log("=" * 62)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("已停止。")
+    while True:
+        host = forced or ts_ip or "127.0.0.1"
+        log("监听地址选定: %s（forced=%s, tailscale=%s）" % (host, forced, ts_ip))
+
+        server = ThreadingHTTPServer((host, port), Handler)
+        server.daemon_threads = True
+        server.bridge_token = token
+
+        log("=" * 62)
+        log("  Edge 浏览器桥已启动")
+        log("  连接地址: http://%s:%d" % (host, port))
+        log("  Token:    %s" % token)
+        log("  把上面「连接地址」和「Token」两行发给助手即可。")
+        if not forced and not ts_ip:
+            log("  !! 警告：没找到 Tailscale 网卡，现在只有本机能连。")
+            log("  !! 桥不会就此认命：每 30 秒自检一次，专线一通自动重绑。")
+        log("  停止方法：关掉这个窗口（或按 Ctrl+C），再关掉那个独立 Edge。")
+        log("=" * 62)
+
+        # 自愈看门狗：只绑在本机时，专线地址出现就关掉当前服务、
+        # 回到循环顶部重绑到专线地址（2.4 起，治冷开机抢跑）。
+        rebind = {"wanted": False}
+        stop_watch = threading.Event()
+
+        def _watchdog():
+            while not stop_watch.wait(30):
+                if forced or host != "127.0.0.1":
+                    return
+                ip = find_tailscale_ip()
+                if ip:
+                    log("看门狗：Tailscale 地址 %s 已出现，重绑监听地址" % ip)
+                    rebind["wanted"] = True
+                    server.shutdown()
+                    return
+
+        watcher = threading.Thread(target=_watchdog, daemon=True)
+        watcher.start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log("已停止。")
+            return
+        finally:
+            stop_watch.set()
+            server.server_close()
+        if not rebind["wanted"]:
+            return
+        ts_ip = find_tailscale_ip()
+        if not ts_ip:
+            ts_ip = None
+            time.sleep(5)
 
 
 if __name__ == "__main__":
