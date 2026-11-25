@@ -38,6 +38,23 @@ ipconfig 解析两条方法。
 形同失效（2026-11-12 晚实证）。新版启动时先等专线地址最多约
 2 分钟；仍等不到才先绑本机，且绑本机期间每 30 秒自检一次，
 专线地址一出现就自动重绑，无需人工重启进程。
+
+版本 2.5：修「桥假活」（2026-11-25 实证：桥启动正常、窗口开着，
+却只应答一次、之后全是空回复，只能靠用户手动重启）——
+1) CDPClient.call 加总截止时间：旧版 recv 循环逐条吞事件、每条
+   都重置单次超时，页面事件不断时永远等不到回复、整条连接吊死；
+   新版一次调用最多等 CDP_CALL_TIMEOUT 秒，超时关连接抛错，
+   上层已有的「重连再试一次」才有机会生效。
+2) CDPManager 取连接不再持锁做网络 IO：旧版建连接时全程持
+   manager 锁，一个标签页建连慢，所有标签页的请求全排队；
+   新版锁外建连、锁内回填，竞态输家关掉自己多建的那条。
+3) POST 端点加请求级超时（REQUEST_TIMEOUT 秒）：端点在工作
+   线程里跑，主应答线程等超时就回 504 并作废相关标签页连接，
+   单个卡死的调用冻不住后续请求；慢请求（>10 秒）落日志。
+4) /health 增加 inflight（在途请求数）：下次再遇「假活」，
+   一眼能分清是桥死了还是有请求吊在里面。
+5) maybe_autolaunch 加 3 秒结果缓存与有界等待，避免并发请求
+   一窝蜂重复探活/重复拉起；log() 写文件加锁防并发写坏行。
 """
 
 import hmac
@@ -86,6 +103,9 @@ except Exception:
 
 # ---------------------------------------------------------------- 工具
 
+_log_lock = threading.Lock()
+
+
 def log(msg):
     line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     try:
@@ -93,8 +113,9 @@ def log(msg):
     except Exception:
         pass
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        with _log_lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
     except Exception:
         pass
 
@@ -111,6 +132,9 @@ class CDPError(Exception):
 
 
 # ---------------------------------------------------------------- CDP 封装
+
+CDP_CALL_TIMEOUT = float(os.environ.get("BRIDGE_CDP_TIMEOUT", "45"))
+
 
 class CDPClient:
     """一条到某个标签页的 CDP WebSocket 连接，按 id 匹配请求/响应。"""
@@ -129,13 +153,30 @@ class CDPClient:
             mid = self._next_id
             self.ws.send(json.dumps({"id": mid, "method": method,
                                      "params": params or {}}))
+            # 总截止：逐条 recv 各自带 30 秒单次超时，但事件不断时单次
+            # 超时永远不触发、循环可以无限吞事件（2.5 前的吊死点）。
+            # 这里给整次调用一个总截止，超时就关连接——连接已不可信，
+            # 关掉后上层重连再试才有意义。
+            deadline = time.time() + CDP_CALL_TIMEOUT
+            skipped = 0
             while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self.close()
+                    raise CDPError(
+                        "CDP 调用超时（%s 秒未等到 %s 的回复，已断开重连）"
+                        % (CDP_CALL_TIMEOUT, method))
+                try:
+                    self.ws.settimeout(min(30, remaining))
+                except Exception:
+                    pass
                 raw = self.ws.recv()
                 if not raw:
                     raise CDPError("CDP 连接被关闭")
                 msg = json.loads(raw)
                 if msg.get("id") != mid:
-                    continue  # 事件通知，忽略
+                    skipped += 1
+                    continue  # 事件通知，忽略（但受总截止约束）
                 if "error" in msg:
                     raise CDPError("CDP 错误: %s" % json.dumps(msg["error"],
                                                                ensure_ascii=False))
@@ -171,12 +212,20 @@ class CDPManager:
         with self._lock:
             if self._browser_client is not None:
                 return self._browser_client
-            ver = self.version()
-            ws_url = ver.get("webSocketDebuggerUrl")
-            if not ws_url:
-                raise CDPError("浏览器没有提供浏览器级调试地址")
-            self._browser_client = CDPClient(ws_url)
-            return self._browser_client
+        # 建连含网络 IO，不持锁做：旧版持锁建连，一个慢建连会把
+        # 所有标签页的请求堵在同一把锁后面（2.5 修）。
+        ver = self.version()
+        ws_url = ver.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise CDPError("浏览器没有提供浏览器级调试地址")
+        client = CDPClient(ws_url)
+        with self._lock:
+            if self._browser_client is None:
+                self._browser_client = client
+                return client
+            winner = self._browser_client
+        client.close()  # 竞态输了，关掉自己多建的这条
+        return winner
 
     def _drop_browser_client(self):
         with self._lock:
@@ -269,12 +318,18 @@ class CDPManager:
             client = self._clients.get(tab_id)
             if client is not None:
                 return client
-            target = self._find_target(tab_id)
-            if not target:
-                raise CDPError("找不到标签页: %s" % tab_id)
-            client = CDPClient(target["webSocketDebuggerUrl"])
-            self._clients[tab_id] = client
-            return client
+        # 同 _get_browser_client：建连不持锁，锁外连、锁内回填。
+        target = self._find_target(tab_id)
+        if not target:
+            raise CDPError("找不到标签页: %s" % tab_id)
+        client = CDPClient(target["webSocketDebuggerUrl"])
+        with self._lock:
+            winner = self._clients.get(tab_id)
+            if winner is None:
+                self._clients[tab_id] = client
+                return client
+        client.close()
+        return winner
 
     def drop_client(self, tab_id):
         with self._lock:
@@ -458,13 +513,33 @@ def ensure_edge(timeout=25):
         "没带调试口（手动打开的那种）——请把 Edge 窗口全部关掉再重试。")
 
 
+_cdp_probe_cache = {"at": 0.0, "up": False}
+_cdp_probe_lock = threading.Lock()
+
+
+def _cdp_up_cached(ttl=3.0):
+    """cdp_up 带短缓存：并发请求别一窝蜂重复探活（每次探活最长 3 秒）。"""
+    now = time.time()
+    with _cdp_probe_lock:
+        if now - _cdp_probe_cache["at"] < ttl:
+            return _cdp_probe_cache["up"]
+    up = cdp_up()
+    with _cdp_probe_lock:
+        _cdp_probe_cache["at"] = time.time()
+        _cdp_probe_cache["up"] = up
+    return up
+
+
 def maybe_autolaunch():
     """CDP 类请求进来时顺手保证 Edge 在跑；关掉开关或 Edge 已在跑时直接返回。"""
     if os.environ.get("BRIDGE_NO_AUTOLAUNCH"):
         return
-    if cdp_up():
+    if _cdp_up_cached():
         return
     ensure_edge()
+    with _cdp_probe_lock:
+        _cdp_probe_cache["at"] = time.time()
+        _cdp_probe_cache["up"] = True
 
 
 # ---------------------------------------------------------------- 业务端点
@@ -777,8 +852,23 @@ ENDPOINTS = {
 
 # ---------------------------------------------------------------- HTTP 服务
 
+REQUEST_TIMEOUT = float(os.environ.get("BRIDGE_REQUEST_TIMEOUT", "150"))
+
+
+class _RequestAlreadyAnswered(Exception):
+    """_run_endpoint 已自行回过响应（如超时 504），do_POST 不再重复发。"""
+_inflight = {"n": 0}
+_inflight_lock = threading.Lock()
+
+
+def _inflight_delta(d):
+    with _inflight_lock:
+        _inflight["n"] += d
+        return _inflight["n"]
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EdgeBridge/2.4"
+    server_version = "EdgeBridge/2.5"
 
     def log_message(self, fmt, *args):  # 只打简洁日志
         log("[%s] %s" % (self.address_string(), fmt % args))
@@ -806,7 +896,8 @@ class Handler(BaseHTTPRequestHandler):
                 cdp_info = "CDP 不可达: %s" % e
             self._send_json(200, {"ok": True, "cdp": cdp_ok,
                                   "browser": cdp_info,
-                                  "version": "2.4",
+                                  "version": "2.5",
+                                  "inflight": _inflight["n"],
                                   "mode": os.environ.get(
                                       "BRIDGE_MODE", "manual")})
         else:
@@ -831,11 +922,15 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError) as e:
             self._send_json(400, {"ok": False, "error": "请求体不是合法 JSON: %s" % e})
             return
+        _inflight_delta(1)
+        started = time.time()
         try:
             if path != "/launch":
                 maybe_autolaunch()
-            result = ENDPOINTS[path](params)
+            result = self._run_endpoint(path, params)
             self._send_json(200, dict({"ok": True}, **result))
+        except _RequestAlreadyAnswered:
+            pass                     # _run_endpoint 已回过 504，别再发第二次
         except ValueError as e:      # 参数问题
             self._send_json(400, {"ok": False, "error": str(e)})
         except CDPError as e:        # 页面/标签页层面的问题
@@ -846,6 +941,46 @@ class Handler(BaseHTTPRequestHandler):
                                   "error": "连不上 Edge 调试口(9222)，请确认已用 start-edge.bat 或 start-edge-main.bat 启动带调试口的 Edge。详情: %s" % e})
         except Exception as e:       # 兜底，绝不让服务崩掉
             self._send_json(500, {"ok": False, "error": "内部错误: %s" % e})
+        finally:
+            elapsed = time.time() - started
+            if elapsed > 10:
+                log("慢请求: %s 用时 %.1f 秒" % (path, elapsed))
+            _inflight_delta(-1)
+
+    def _run_endpoint(self, path, params):
+        """在工作线程里跑端点，主应答线程只等 REQUEST_TIMEOUT 秒。
+
+        旧版端点直接在应答线程里跑：某个调用一旦吊死（页面无响应、
+        CDP 等不到回复），调用方只能干等到自己超时，还看不出桥是
+        死是活。新版超时先回 504，并作废该标签页的 CDP 连接——
+        吊死的线程让它自生自灭，下一个请求走新连接，不被它堵住。
+        异常在工作线程里捕获、原样带回主线程，保持原有状态码映射。
+        """
+        box = {}
+
+        def _work():
+            try:
+                box["result"] = ENDPOINTS[path](params)
+            except BaseException as e:  # noqa: BLE001 带回主线程统一映射
+                box["error"] = e
+
+        worker = threading.Thread(target=_work, daemon=True)
+        worker.start()
+        worker.join(REQUEST_TIMEOUT)
+        if worker.is_alive():
+            tab_id = params.get("tabId")
+            if tab_id:
+                CDP.drop_client(tab_id)
+            log("请求超时: %s 超过 %.0f 秒未返回，已回 504 并作废该标签页连接"
+                % (path, REQUEST_TIMEOUT))
+            self._send_json(504, {"ok": False,
+                                  "error": "请求超时（%.0f 秒）：%s 未返回，"
+                                           "桥还活着，可重试或换标签页"
+                                           % (REQUEST_TIMEOUT, path)})
+            raise _RequestAlreadyAnswered()
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
 
 
 # ---------------------------------------------------------------- 启动辅助
